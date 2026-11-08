@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>APK X-ray</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--line:#2a2f3a;--tx:#e6e8ee;--mu:#8b93a5;--ac:#4fc3f7;--bad:#ff6b6b;--warn:#ffb74d;--ok:#81c784}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--tx);font:15px/1.45 system-ui,sans-serif;max-width:900px;margin:auto}
+h1{margin:8px 0 2px}.sub{color:var(--mu);margin:0 0 14px}
+#drop{display:block;border:2px dashed var(--line);border-radius:14px;padding:28px;text-align:center;color:var(--mu);cursor:pointer}
+#drop.over,#drop:hover{border-color:var(--ac);color:var(--tx)}
+input[type=file]{display:none}
+details{background:var(--card);border:1px solid var(--line);border-radius:12px;margin:10px 0;padding:0 14px}
+summary{cursor:pointer;padding:12px 0;font-weight:600}
+summary span{color:var(--mu);font-weight:400;margin-left:6px}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:4px 10px;padding-bottom:12px}
+.kv div:nth-child(odd){color:var(--mu)}
+.kv div{word-break:break-all}
+.chip{display:inline-block;margin:2px 4px 6px 0;padding:2px 9px;border-radius:99px;background:#232834;font-size:13px;word-break:break-all}
+.bad{background:#3b1f23;color:var(--bad)}.warn{background:#3a2e1a;color:var(--warn)}.ok{background:#1f3322;color:var(--ok)}
+.list{padding-bottom:12px;max-height:340px;overflow:auto;font:13px/1.5 ui-monospace,Menlo,monospace;word-break:break-all}
+.list div{border-top:1px solid var(--line);padding:3px 0}
+button{background:var(--ac);color:#000;border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;margin:6px 0}
+.msg{color:var(--warn);padding:6px 0}
+</style>
+</head>
+<body>
+<h1>APK X-ray</h1>
+<p class="sub">Drop an APK to see permissions, trackers, crypto, URLs and secrets. Everything runs locally in your browser.</p>
+<label id="drop">Tap or drop an .apk file here<input type="file" id="f" accept=".apk,.zip,.xapk,application/vnd.android.package-archive"></label>
+<div id="out"></div>
+<script>
+const u16=(d,o)=>d.getUint16(o,true),u32=(d,o)=>d.getUint32(o,true);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function readZip(buf){
+  const dv=new DataView(buf);let e=-1;
+  for(let i=buf.byteLength-22;i>=Math.max(0,buf.byteLength-65557);i--)if(u32(dv,i)===0x06054b50){e=i;break}
+  if(e<0)throw new Error('Not a ZIP/APK file');
+  const n=u16(dv,e+10);let p=u32(dv,e+16);const files=[],td=new TextDecoder();
+  for(let i=0;i<n;i++){
+    if(u32(dv,p)!==0x02014b50)break;
+    const method=u16(dv,p+10),csize=u32(dv,p+20),usize=u32(dv,p+24),nl=u16(dv,p+28),xl=u16(dv,p+30),cl=u16(dv,p+32),off=u32(dv,p+42);
+    files.push({name:td.decode(new Uint8Array(buf,p+46,nl)),method,csize,usize,off});
+    p+=46+nl+xl+cl;
+  }
+  return files;
+}
+async function getData(buf,f){
+  const dv=new DataView(buf),s=f.off+30+u16(dv,f.off+26)+u16(dv,f.off+28);
+  const raw=new Uint8Array(buf,s,f.csize);
+  if(f.method===0)return raw;
+  if(f.method!==8)throw new Error('Unsupported compression '+f.method);
+  const r=new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw')));
+  return new Uint8Array(await r.arrayBuffer());
+}
+function readPool(dv,u8,p){
+  const n=u32(dv,p+8),fl=u32(dv,p+16),st=u32(dv,p+20),hs=u16(dv,p+2),utf8=(fl&0x100)!==0,out=[],td=new TextDecoder();
+  for(let i=0;i<n;i++){
+    let o=p+st+u32(dv,p+hs+i*4);
+    if(utf8){
+      const l=u8[o++];if(l&0x80)o++;
+      let b=u8[o++];if(b&0x80)b=((b&0x7f)<<8)|u8[o++];
+      out.push(td.decode(u8.subarray(o,o+b)));
+    }else{
+      let l=u16(dv,o);o+=2;
+      if(l&0x8000){l=((l&0x7fff)<<16)|u16(dv,o);o+=2}
+      let s='';for(let k=0;k<l;k++)s+=String.fromCharCode(u16(dv,o+k*2));
+      out.push(s);
+    }
+  }
+  return out;
+}
+function parseAxml(u8){
+  const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+  if(u16(dv,0)!==3)throw new Error('Manifest is not binary XML');
+  let p=u16(dv,2),strs=[];const els=[];
+  while(p+8<=u8.length){
+    const t=u16(dv,p),sz=u32(dv,p+4);
+    if(sz<8)break;
+    if(t===1)strs=readPool(dv,u8,p);
+    else if(t===0x102){
+      const ao=p+16+u16(dv,p+24),asz=u16(dv,p+26)||20,ac=u16(dv,p+28),a={};
+      for(let i=0;i<ac;i++){
+        const q=ao+i*asz,raw=u32(dv,q+8),ty=u8[q+15],dat=u32(dv,q+16);
+        let v;
+        if(raw!==0xFFFFFFFF)v=strs[raw];
+        else if(ty===3)v=strs[dat];
+        else if(ty===0x12)v=dat!==0;
+        else if(ty===0x10)v=dat|0;
+        else if(ty===1)v='@0x'+dat.toString(16);
+        else v='0x'+dat.toString(16);
+        a[strs[u32(dv,q+4)]||'?']=v;
+      }
+      els.push({tag:strs[u32(dv,p+20)],a});
+    }
+    p+=sz;
+  }
+  return els;
+}
+function dexStrings(u8){
+  const dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength),td=new TextDecoder(),out=[];
+  if(u8[0]!==0x64||u8[1]!==0x65||u8[2]!==0x78)return out;
+  const n=u32(dv,0x38),off=u32(dv,0x3c);
+  for(let i=0;i<n;i++){
+    let o=u32(dv,off+i*4),b;
+    do{b=u8[o++]}while(b&0x80);
+    let e=o;while(e<u8.length&&u8[e]!==0)e++;
+    out.push(td.decode(u8.subarray(o,e)));
+  }
+  return out;
+}
+
+const TRACKERS=[['com/google/firebase/analytics','Firebase Analytics'],['com/google/android/gms/analytics','Google Analytics'],['com/google/android/gms/ads','Google AdMob'],['com/google/firebase/crashlytics','Crashlytics'],['com/crashlytics','Crashlytics'],['com/facebook/ads','Facebook Audience Network'],['com/facebook/appevents','Facebook SDK events'],['com/appsflyer','AppsFlyer'],['com/adjust/sdk','Adjust'],['com/flurry','Flurry'],['io/branch','Branch'],['com/mixpanel','Mixpanel'],['com/amplitude','Amplitude'],['com/unity3d/ads','Unity Ads'],['com/applovin','AppLovin'],['com/ironsource','ironSource'],['com/vungle','Vungle'],['com/chartboost','Chartboost'],['com/startapp','StartApp'],['com/mopub','MoPub'],['com/onesignal','OneSignal'],['com/bugsnag','Bugsnag'],['io/sentry','Sentry'],['com/segment/analytics','Segment'],['com/microsoft/appcenter','App Center'],['com/yandex/metrica','Yandex Metrica'],['com/tencent/bugly','Tencent Bugly'],['com/umeng','Umeng'],['com/inmobi','InMobi'],['com/google/android/play/core','Play Core']];
+const CRYPTO_CLASSES=[['Ljavax/crypto/Cipher;','javax.crypto.Cipher'],['Ljavax/crypto/Mac;','javax.crypto.Mac'],['Ljava/security/MessageDigest;','MessageDigest'],['Ljava/security/Signature;','Signature'],['Ljavax/crypto/spec/SecretKeySpec;','SecretKeySpec (hardcoded keys possible)'],['Ljavax/crypto/spec/IvParameterSpec;','IvParameterSpec'],['Ljavax/crypto/SecretKeyFactory;','SecretKeyFactory'],['Ljavax/crypto/spec/PBEKeySpec;','PBEKeySpec'],['Landroid/security/keystore/KeyGenParameterSpec;','Android Keystore'],['Lorg/bouncycastle/','BouncyCastle'],['Lcom/google/crypto/tink/','Tink'],['Lnet/sqlcipher/','SQLCipher'],['Lnet/zetetic/','SQLCipher']];
+const DANGEROUS=/(CAMERA|RECORD_AUDIO|CONTACTS|LOCATION|SMS|PHONE_STATE|CALL_LOG|CALENDAR|BODY_SENSORS|EXTERNAL_STORAGE|SYSTEM_ALERT_WINDOW|INSTALL_PACKAGES|ACCESSIBILITY|QUERY_ALL_PACKAGES|READ_MEDIA|MANAGE_EXTERNAL|CALL_PHONE|PROCESS_OUTGOING|DEVICE_ADMIN|WRITE_SETTINGS|PACKAGE_USAGE|NOTIFICATION_LISTENER)/;
+const SECRETS=[['Google API key',/AIza[0-9A-Za-z_-]{35}/g],['AWS access key',/AKIA[0-9A-Z]{16}/g],['Stripe live key',/sk_live_[0-9a-zA-Z]{20,}/g],['Slack token',/xox[baprs]-[0-9A-Za-z-]{10,}/g],['Private key block',/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g],['GitHub token',/gh[pous]_[0-9A-Za-z]{36}/g],['JWT',/eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g]];
+const NOISE=/^https?:\/\/(schemas\.android\.com|www\.w3\.org|xmlpull\.org|www\.apache\.org|apache\.org|ns\.adobe\.com|purl\.org|java\.sun\.com|developer\.android\.com|www\.example\.com|localhost)/i;
+
+async function analyze(file){
+  const buf=await file.arrayBuffer(),warn=[],td=new TextDecoder();
+  const files=readZip(buf),R={file:file.name,size:file.size};
+  try{R.sha256=[...new Uint8Array(await crypto.subtle.digest('SHA-256',buf))].map(b=>b.toString(16).padStart(2,'0')).join('')}catch(e){R.sha256='(unavailable)'}
+  // manifest
+  const mf=files.find(f=>f.name==='AndroidManifest.xml');
+  let els=[];
+  if(mf)try{els=parseAxml(await getData(buf,mf))}catch(e){warn.push('Manifest: '+e.message)}else warn.push('No AndroidManifest.xml found');
+  const first=t=>els.find(e=>e.tag===t),all=t=>els.filter(e=>e.tag===t);
+  const m=first('manifest')?.a||{},app=first('application')?.a||{},sdk=first('uses-sdk')?.a||{};
+  R.package=m.package;R.versionName=m.versionName;R.versionCode=m.versionCode;R.minSdk=sdk.minSdkVersion;R.targetSdk=sdk.targetSdkVersion;
+  R.permissions=[...new Set(all('uses-permission').concat(all('uses-permission-sdk-23')).map(e=>e.a.name).filter(Boolean))].sort();
+  R.flags={debuggable:app.debuggable===true,allowBackup:app.allowBackup!==false,cleartext:app.usesCleartextTraffic===true,testOnly:app.testOnly===true,networkSecurityConfig:!!app.networkSecurityConfig};
+  R.components=[];
+  for(const t of ['activity','activity-alias','service','receiver','provider'])for(const e of all(t))R.components.push({type:t,name:e.a.name,exported:e.a.exported===true});
+  R.deeplinks=[...new Set(all('data').filter(e=>e.a.scheme).map(e=>e.a.scheme+'://'+(e.a.host||'')))];
+  // dex + text
+  const strings=[];let dexCount=0;
+  for(const f of files)if(/^classes\d*\.dex$/.test(f.name)){
+    dexCount++;
+    try{for(const s of dexStrings(await getData(buf,f)))strings.push(s)}catch(e){warn.push(f.name+': '+e.message)}
+  }
+  if(!dexCount)warn.push('No classes.dex found (packed, split or non-standard APK)');
+  const texts=[];
+  for(const f of files)if(/^(assets|res\/raw)\/.+\.(json|js|xml|txt|properties|html|cfg|ini|conf)$/i.test(f.name)&&f.usize<2e6)
+    try{texts.push(td.decode(await getData(buf,f)))}catch(e){}
+  const classes=new Set(strings.filter(s=>/^L[\w$\/]+;$/.test(s)));
+  const hasPrefix=p=>{for(const c of classes)if(c.startsWith(p))return true;return false};
+  R.trackers=[...new Set(TRACKERS.filter(([p])=>hasPrefix('L'+p)).map(t=>t[1]))];
+  R.crypto=CRYPTO_CLASSES.filter(([p])=>p.endsWith(';')?classes.has(p):hasPrefix(p)).map(c=>({text:c[1],weak:false}));
+  const seen=new Set();
+  for(const s of strings){
+    if(seen.has(s))continue;
+    if(/^(AES|DES|DESede|RSA|Blowfish|RC4|ARCFOUR|ChaCha20)(\/[A-Za-z0-9]+\/[A-Za-z0-9]+)?$/.test(s)||/^PBKDF2With\w+$/.test(s)||/^Hmac\w+$/.test(s)||/^(MD5|SHA-?1|SHA-?256|SHA-?384|SHA-?512)$/.test(s)){
+      seen.add(s);R.crypto.push({text:s,weak:/^DES|ECB|RC4|ARCFOUR|^MD5$|^SHA-?1$/.test(s)});
+    }
+  }
+  const big=strings.join('\n')+'\n'+texts.join('\n');
+  const urls=new Set(),noise=new Set();
+  for(const x of big.matchAll(/https?:\/\/[^\s"'<>\\)\]}]{4,200}/g))(NOISE.test(x[0])?noise:urls).add(x[0]);
+  R.urls=[...urls].sort();R.noiseUrls=noise.size;
+  R.ips=[...new Set([...big.matchAll(/\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b/g)].map(x=>x[0]).filter(ip=>!/^(0\.|127\.|255\.)/.test(ip)&&ip!=='1.0.0.0'))].sort();
+  R.secrets=[];
+  for(const [n,re] of SECRETS)for(const x of new Set([...big.matchAll(re)].map(y=>y[0])))R.secrets.push({type:n,value:x.length>70?x.slice(0,70)+'…':x});
+  // files
+  const libs={};
+  for(const f of files){const x=/^lib\/([^/]+)\/(.+\.so)$/.exec(f.name);if(x)(libs[x[1]]=libs[x[1]]||[]).push(x[2])}
+  R.libs=libs;
+  R.nativeCrypto=Object.values(libs).flat().filter(n=>/crypto|ssl|sodium|mbedtls|wolfssl/i.test(n));
+  R.signature=files.filter(f=>/^META-INF\/.+\.(RSA|DSA|EC|SF|MF)$/i.test(f.name)).map(f=>f.name);
+  R.fileCount=files.length;R.dexCount=dexCount;R.classCount=classes.size;
+  R.biggest=files.slice().sort((a,b)=>b.usize-a.usize).slice(0,25).map(f=>[f.name,f.usize]);
+  R.warnings=warn;
+  return R;
+}
+
+//--UI
+const out=document.getElementById('out');
+const fmt=n=>n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':n+' B';
+const sec=(t,c,h,open)=>`<details${open?' open':''}><summary>${t}<span>${c}</span></summary>${h}</details>`;
+const chips=(a,cls)=>a.map(x=>`<span class="chip ${cls?cls(x):''}">${esc(x)}</span>`).join('');
+const rows=a=>`<div class="list">${a.map(x=>`<div>${esc(x)}</div>`).join('')}</div>`;
+function render(R){
+  const fl=R.flags,h=[];
+  if(R.warnings.length)h.push(R.warnings.map(w=>`<div class="msg">${esc(w)}</div>`).join(''));
+  h.push(sec('Summary',R.package||'',`<div class="kv"><div>File</div><div>${esc(R.file)} (${fmt(R.size)})</div><div>Package</div><div>${esc(R.package||'?')}</div><div>Version</div><div>${esc(R.versionName||'?')} (${esc(R.versionCode??'?')})</div><div>SDK</div><div>min ${esc(R.minSdk??'?')}, target ${esc(R.targetSdk??'?')}</div><div>SHA-256</div><div>${esc(R.sha256)}</div><div>Contents</div><div>${R.fileCount} files, ${R.dexCount} dex, ${R.classCount} classes</div></div>`,true));
+  h.push(sec('Flags','',`<div>${chips([(fl.debuggable?'debuggable: YES':'debuggable: no'),(fl.allowBackup?'allowBackup: yes':'allowBackup: no'),(fl.cleartext?'cleartext traffic: allowed':'cleartext: not forced'),(fl.testOnly?'testOnly: YES':'testOnly: no'),(fl.networkSecurityConfig?'network security config: yes':'network security config: no')],x=>/YES|allowed/.test(x)?'bad':/allowBackup: yes/.test(x)?'warn':'')}</div>`,true));
+  h.push(sec('Permissions',R.permissions.length,`<div>${chips(R.permissions.map(p=>p.replace('android.permission.','')),p=>DANGEROUS.test(p)?'bad':'')}</div>`,true));
+  h.push(sec('Trackers & SDKs',R.trackers.length,R.trackers.length?`<div>${chips(R.trackers,()=>'warn')}</div>`:'<p class="sub">None of the known tracker signatures found.</p>',true));
+  h.push(sec('Encryption',R.crypto.length+R.nativeCrypto.length,`<div>${chips(R.crypto.map(c=>c.text+(c.weak?' (weak)':'')),x=>/weak/.test(x)?'bad':'ok')}${chips(R.nativeCrypto.map(n=>'native: '+n))}</div>`+(R.crypto.length?'':'<p class="sub">No crypto API usage found in dex.</p>'),true));
+  h.push(sec('Possible secrets',R.secrets.length,R.secrets.length?rows(R.secrets.map(s=>s.type+': '+s.value)):'<p class="sub">No known key patterns found.</p>',R.secrets.length>0));
+  h.push(sec('URLs',R.urls.length,rows(R.urls)+(R.noiseUrls?`<p class="sub">${R.noiseUrls} common schema/namespace URLs hidden.</p>`:'')));
+  h.push(sec('IP addresses',R.ips.length,rows(R.ips)));
+  h.push(sec('Deep links',R.deeplinks.length,rows(R.deeplinks)));
+  h.push(sec('Components',R.components.length,rows(R.components.map(c=>`${c.exported?'[exported] ':''}${c.type}: ${c.name}`))));
+  h.push(sec('Native libraries',Object.keys(R.libs).join(', ')||'none',rows(Object.entries(R.libs).map(([a,l])=>a+': '+l.join(', ')))));
+  h.push(sec('Signature files',R.signature.length,rows(R.signature)));
+  h.push(sec('Biggest files',R.biggest.length,rows(R.biggest.map(([n,s])=>fmt(s)+'  '+n))));
+  h.push('<button id="dl">Download report (JSON)</button>');
+  out.innerHTML=h.join('');
+  document.getElementById('dl').onclick=()=>{
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{type:'application/json'}));
+    a.download=(R.package||'apk')+'-xray.json';a.click();
+  };
+}
+async function run(file){
+  if(!file)return;
+  out.innerHTML='<p class="sub">Analysing '+esc(file.name)+'…</p>';
+  try{render(await analyze(file))}catch(e){out.innerHTML='<div class="msg">Error: '+esc(e.message)+'</div>'}
+}
+const drop=document.getElementById('drop'),inp=document.getElementById('f');
+inp.onchange=()=>run(inp.files[0]);
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>run(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>
